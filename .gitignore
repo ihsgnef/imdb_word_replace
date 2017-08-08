@@ -1,0 +1,12 @@
+data
+results
+trees
+__pycache__
+*.pyc
+.ipynb_checkpoints
+*.swn
+*.swo
+*.swp
+*~
+.DS_Store
+.*cache
