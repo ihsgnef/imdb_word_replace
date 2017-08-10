@@ -3,6 +3,8 @@ import sys
 import time
 import glob
 import argparse
+import pickle
+import numpy as np
 from tqdm import tqdm
 
 import torch
@@ -11,6 +13,13 @@ from torch.autograd import Variable
 
 from torchtext import data
 from torchtext import datasets
+
+
+extracted_grads = {}
+def extract_grad_hook(name):
+    def hook(grad):
+        extracted_grads[name] = grad
+    return hook
 
 class ConvModel(nn.Module):
     
@@ -31,8 +40,10 @@ class ConvModel(nn.Module):
                 nn.Linear(cfg.hidden_size * len(cfg.filter_sizes), cfg.output_size)
                 )
 
-    def forward(self, inputs):
+    def forward(self, inputs, extract_inputs_embed_grad=False):
         inputs_embed = self.embed(inputs) 
+        if extract_inputs_embed_grad:
+            inputs_embed.register_hook(extract_grad_hook('inputs_embed'))
         # length, batch_size, embed_size -> batch_size, embed_dim, length
         inputs_embed = inputs_embed.transpose(0, 1).transpose(1, 2)
         mots = []
@@ -57,10 +68,12 @@ class LSTMModel(nn.Module):
                 nn.Linear(cfg.hidden_size, cfg.output_size)
                 )
 
-    def forward(self, inputs):
+    def forward(self, inputs, extract_inputs_embed_grad=False):
         length, batch_size = inputs.size()
         hidden = self.init_hidden(batch_size)
         inputs_embed = self.embed(inputs)
+        if extract_inputs_embed_grad:
+            inputs_embed.register_hook(extract_grad_hook('inputs_embed'))
         output, hidden = self.lstm(inputs_embed, hidden)
         output = output[-1]
         output = self.fconns(output)
@@ -129,11 +142,12 @@ def parse_args_conv():
     args = parser.parse_args()
     return args
 
-def main():
-    args = parse_args_conv()
+parse_args = parse_args_lstm
+
+def setup(args):
     torch.cuda.set_device(args.gpu)
 
-    ### data setup
+    ### setup data
     TEXT = data.Field()
     LABEL = data.Field(sequential=False)
     
@@ -165,18 +179,24 @@ def main():
     print('embed size', args.embed_size)
     print('output size', args.output_size)
 
-    ### model setup
+    ### setup model
     if args.resume_snapshot:
         model = torch.load(args.resume_snapshot, 
-                map_localtion=lambda storage, location: storage.cuda(args.gpu))
+                map_location=lambda storage, location: storage.cuda(args.gpu))
     else:
         model = globals()[args.model_class](args)
-
+    
         if args.wv_type:
             model.embed.weight.data = TEXT.vocab.vectors
         
         if args.gpu >= 0:
             model.cuda()
+
+    return args, TEXT, LABEL, train_iter, dev_iter, test_iter, model
+
+def train():
+    args = parse_args()
+    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
 
     ### training setup
     criterion = nn.CrossEntropyLoss()
@@ -259,7 +279,94 @@ def main():
             #             n_total, train_acc)
         if report_string:
             print(report_string)
-        
 
+def test():
+    args = parse_args()
+    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
+
+    snapshot_prefix = os.path.join(
+            args.save_path, args.model_name + '_best_snapshot')
+    resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
+    print(resume_snapshot)
+    model = torch.load(resume_snapshot, 
+            map_location=lambda storage, location: storage.cuda(args.gpu))
+
+    def eval(iterator):
+        model.eval()
+        iterator.init_epoch()
+        n_dev_correct = n_dev_total = 0
+        dev_loss = 0
+        criterion = nn.CrossEntropyLoss()
+        for dev_batch_idx, dev_batch in enumerate(iterator):
+            y = model(dev_batch.text)
+            predictions = torch.max(y, 1)[1].view(dev_batch.label.size())
+            n_dev_correct += (predictions.data == dev_batch.label.data).sum()
+            n_dev_total += dev_batch.batch_size
+            dev_loss += criterion(y, dev_batch.label).data[0]
+        dev_acc = 100 * n_dev_correct / n_dev_total
+        return dev_loss / n_dev_total, dev_acc
+
+    dev_loss, dev_acc = eval(dev_iter)
+    print('dev {0} {1}'.format(dev_loss, dev_acc))
+
+    test_loss, test_acc = eval(test_iter)
+    print('test {0} {1}'.format(test_loss, test_acc))
+
+def clean_sentence(sent):
+    if isinstance(sent, str):
+        sent = sent.split(' ')
+    useless_words = ['<pad>', '.', ',']
+    sent = [x for x in sent if x not in useless_words]
+    sent = ' '.join(sent).lower()
+    return sent
+
+def foo():
+    args = parse_args()
+    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
+
+    snapshot_prefix = os.path.join(
+            args.save_path, args.model_name + '_best_snapshot')
+    resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
+    print(resume_snapshot)
+    model = torch.load(resume_snapshot, 
+            map_location=lambda storage, location: storage.cuda(args.gpu))
+
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    dev_iter.init_epoch()
+    dev_iter.train = True
+    
+    out = open('output.txt', 'w')
+    pkl = []
+
+    for batch_idx, batch in enumerate(tqdm(dev_iter)):
+        y = model(batch.text, extract_inputs_embed_grad=True)
+        loss = criterion(y, batch.label)
+        model.zero_grad()
+        loss.backward()
+        grad = extracted_grads['inputs_embed'].sum(dim=2).squeeze(2)
+        grad = grad.transpose(0, 1).data.cpu().numpy()
+        text = batch.text.transpose(0, 1)
+        y = y.data.cpu().numpy()
+        prediction = np.argmax(y, axis=1)
+        label = batch.label.data.cpu().numpy()
+        
+        for i in range(batch.batch_size):
+            scores = np.abs(grad[i])
+            order = np.argsort(scores)[::-1]
+            words = text[i].data.cpu().numpy()
+            words = [TEXT.vocab.itos[x] for x in words]
+            sorted_sent = [words[j] for j in order]
+            sent = [x for x in words]
+            pkl.append([])
+            pkl[-1].append(clean_sentence(sent))
+            pkl[-1].append(clean_sentence(sorted_sent))
+            pkl[-1].append(LABEL.vocab.itos[label[i]])
+            pkl[-1].append(LABEL.vocab.itos[prediction[i]])
+            out.write('\n'.join(pkl[-1]) + '\n\n')
+            pkl[-1].append(order)
+    with open('output.pkl', 'wb') as f:
+        pickle.dump(pkl, f)
+        
 if __name__ == '__main__':
-    main()
+    foo()
