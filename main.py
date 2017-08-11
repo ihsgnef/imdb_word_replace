@@ -18,6 +18,7 @@ from torchtext import datasets
 
 def parse_args_common():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', default='bar')
     parser.add_argument('--fix_embedding', type=bool, default=False)
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=128)
@@ -55,8 +56,6 @@ def parse_args_conv():
     parser.add_argument('--dropout', type=float, default=0.5)
     args = parser.parse_args()
     return args
-
-parse_args = parse_args_lstm
 
 
 class ConvModel(nn.Module):
@@ -152,7 +151,7 @@ def setup(args):
     LABEL = data.Field(sequential=False)
     
     train_set, dev_set, test_set = datasets.SST.splits(
-            TEXT, LABEL, fine_grained=True, train_subtrees=True,
+            TEXT, LABEL, fine_grained=False, train_subtrees=True,
             filter_pred=lambda x: x.label != 'neutral')
     
     TEXT.build_vocab(train_set)
@@ -195,8 +194,7 @@ def setup(args):
 
     return args, TEXT, LABEL, train_iter, dev_iter, test_iter, model
 
-def train():
-    args = parse_args()
+def train(args):
     args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
 
     ### training setup
@@ -282,8 +280,7 @@ def train():
         if report_string:
             print(report_string)
 
-def test():
-    args = parse_args()
+def test(args):
     snapshot_prefix = os.path.join(
             args.save_path, args.model_name + '_best_snapshot')
     args.resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
@@ -318,60 +315,10 @@ def clean_sentence(sent):
     sent = ' '.join(sent).lower()
     return sent
 
-def foo():
-    args = parse_args()
-    snapshot_prefix = os.path.join(
-            args.save_path, args.model_name + '_best_snapshot')
-    args.resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
-    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
-
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    dev_iter.init_epoch()
-    dev_iter.train = True
-    
-    out = open('output.txt', 'w')
-    pkl = []
-    
-    extracted_grads = {}
-    def extract_grad_hook(name):
-        def hook(grad):
-            extracted_grads[name] = grad
-        return hook
-
-    for batch_idx, batch in enumerate(tqdm(dev_iter)):
-        y = model(batch.text, extract_grad_hook('inputs_embed'))
-        loss = criterion(y, batch.label)
-        model.zero_grad()
-        loss.backward()
-        grad = extracted_grads['inputs_embed'].sum(dim=2).squeeze(2)
-        grad = grad.transpose(0, 1).data.cpu().numpy()
-        text = batch.text.transpose(0, 1)
-        y = y.data.cpu().numpy()
-        prediction = np.argmax(y, axis=1)
-        label = batch.label.data.cpu().numpy()
-        
-        for i in range(batch.batch_size):
-            scores = np.abs(grad[i])
-            order = np.argsort(scores)[::-1]
-            words = text[i].data.cpu().numpy()
-            words = [TEXT.vocab.itos[x] for x in words]
-            sorted_sent = [words[j] for j in order]
-            sent = [x for x in words]
-            pkl.append([])
-            pkl[-1].append(clean_sentence(sent))
-            pkl[-1].append(clean_sentence(sorted_sent))
-            pkl[-1].append(LABEL.vocab.itos[label[i]])
-            pkl[-1].append(LABEL.vocab.itos[prediction[i]])
-            out.write('\n'.join(pkl[-1]) + '\n\n')
-            pkl[-1].append(order)
-    with open('output.pkl', 'wb') as f:
-        pickle.dump(pkl, f)
-
-def bar():
-    args = parse_args()
-    args.n_replace = 5
+def bar(args):
+    args.n_replace = 1
     args.eps = 10
+    args.norm = np.inf
     snapshot_prefix = os.path.join(
             args.save_path, args.model_name + '_best_snapshot')
     args.resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
@@ -379,8 +326,9 @@ def bar():
 
     model.eval()
     criterion = nn.CrossEntropyLoss()
-    dev_iter.init_epoch()
-    dev_iter.train = True
+    iterator = dev_iter
+    iterator.init_epoch()
+    iterator.train = True
 
     tree = KDTree(TEXT.vocab.vectors.numpy())
     print('KDTree built for {} words'.format(len(TEXT.vocab)))
@@ -394,15 +342,38 @@ def bar():
             extracted_grads[name] = grad
         return hook
 
+    checkpoint = []
+
+    def to_numpy(x):
+        if isinstance(x, Variable):
+            x = x.data
+        try:
+            if x.is_cuda:
+                x = x.cpu()
+        except AttributeError:
+            pass
+        if isinstance(x, torch.LongTensor) or isinstance(x, torch.FloatTensor):
+            x = x.numpy()
+        return x
+
+    def to_sentence(words):
+        words = to_numpy(words)
+        words = [TEXT.vocab.itos[w] for w in words]
+        words = [w for w in words if w != '<pad>']
+        return ' '.join(words)
+
     n_correct = n_total = n_words = 0
     n_correct_ordered_gradient = 0
     n_correct_ordered_random = 0
     n_correct_random_gradient = 0
     n_correct_random_random = 0
-    for batch_idx, batch in enumerate(tqdm(dev_iter)):
+    for batch_idx, batch in enumerate(iterator):
+        preds = []
+        if batch_idx > 0:
+            break
         y = model(batch.text, extract_grad_hook('inputs_embed'))
-        predictions = torch.max(y, 1)[1].view(batch.label.size())
-        n_correct += (predictions.data == batch.label.data).sum()
+        preds.append(torch.max(y, 1)[1].view(batch.label.size()))
+        n_correct += (preds[0].data == batch.label.data).sum()
         n_total += batch.batch_size
         n_words += batch.text.size(0) * batch.batch_size
 
@@ -417,10 +388,10 @@ def bar():
         text = batch.text.transpose(0, 1).data.cpu().numpy()
         y = y.data.cpu().numpy()
 
-        batch_text_ordered_gradient = batch.text.data.clone()
-        batch_text_ordered_random = batch.text.data.clone()
-        batch_text_random_gradient = batch.text.data.clone()
-        batch_text_random_random = batch.text.data.clone()
+        batch_text_ordered_gradient = batch.text.data.clone().transpose(0, 1)
+        batch_text_ordered_random = batch.text.data.clone().transpose(0, 1)
+        batch_text_random_gradient = batch.text.data.clone().transpose(0, 1)
+        batch_text_random_random = batch.text.data.clone().transpose(0, 1)
         for i in range(batch.batch_size):
             remain_idxs = [j for j, x in enumerate(text[i]) if x not in exclude_list]
             order = np.argsort(np.abs(scores[i]))[::-1]
@@ -429,60 +400,78 @@ def bar():
             for j in order[:args.n_replace]:
                 old_embed = TEXT.vocab.vectors[text[i][j]].numpy()
                 word_grad = grads[i][j]
-                word_grad /= np.linalg.norm(word_grad)
+                word_grad /= np.linalg.norm(word_grad, ord=args.norm)
 
                 # ordered by norm of gradient and perturbed by gradient
                 new_embed_grd = old_embed + word_grad * args.eps
                 _, inds = tree.query(new_embed_grd, k=2)
                 repl = inds[0][0] if inds[0][0] != text[i][j] else inds[0][1]
-                batch_text_ordered_gradient[j][i] = repl.item()
+                batch_text_ordered_gradient[i][j] = repl.item()
 
                 # ordered by norm of gradient and perturbed by random noise
                 new_embed_rnd = old_embed + np.random.randn(args.embed_size) * args.eps
                 _, inds = tree.query(new_embed_rnd, k=2)
                 repl = inds[0][0] if inds[0][0] != text[i][j] else inds[0][1]
-                batch_text_ordered_random[j][i] = repl.item()
+                batch_text_ordered_random[i][j] = repl.item()
 
             rnd_order = random.sample(remain_idxs, len(remain_idxs))
             for j in rnd_order[:args.n_replace]:
                 old_embed = TEXT.vocab.vectors[text[i][j]].numpy()
                 word_grad = grads[i][j]
-                word_grad /= np.linalg.norm(word_grad)
+                word_grad /= np.linalg.norm(word_grad, ord=args.norm)
 
                 # ordered by random and perturbed by gradient
                 new_embed = old_embed + word_grad * args.eps
                 _, inds = tree.query(new_embed, k=2)
                 repl = inds[0][0] if inds[0][0] != text[i][j] else inds[0][1]
-                batch_text_random_gradient[j][i] = repl.item()
+                batch_text_random_gradient[i][j] = repl.item()
 
                 # ordered by random and perturbed by random noise
                 new_embed = old_embed + np.random.randn(args.embed_size) * args.eps
                 _, inds = tree.query(new_embed, k=2)
                 repl = inds[0][0] if inds[0][0] != text[i][j] else inds[0][1]
-                batch_text_random_random[j][i] = repl.item()
+                batch_text_random_random[i][j] = repl.item()
 
-        y = model(Variable(batch_text_ordered_gradient))
-        predictions = torch.max(y, 1)[1].view(batch.label.size())
-        n_correct_ordered_gradient += (predictions.data == batch.label.data).sum()
+        y = model(Variable(batch_text_ordered_gradient).transpose(0, 1))
+        preds.append(torch.max(y, 1)[1].view(batch.label.size()))
+        n_correct_ordered_gradient += (preds[1].data == batch.label.data).sum()
 
-        y = model(Variable(batch_text_ordered_random))
-        predictions = torch.max(y, 1)[1].view(batch.label.size())
-        n_correct_ordered_random += (predictions.data == batch.label.data).sum()
+        y = model(Variable(batch_text_ordered_random).transpose(0, 1))
+        preds.append(torch.max(y, 1)[1].view(batch.label.size()))
+        n_correct_ordered_random += (preds[2].data == batch.label.data).sum()
 
-        y = model(Variable(batch_text_random_gradient))
-        predictions = torch.max(y, 1)[1].view(batch.label.size())
-        n_correct_random_gradient += (predictions.data == batch.label.data).sum()
+        y = model(Variable(batch_text_random_gradient).transpose(0, 1))
+        preds.append(torch.max(y, 1)[1].view(batch.label.size()))
+        n_correct_random_gradient += (preds[3].data == batch.label.data).sum()
 
-        y = model(Variable(batch_text_random_random))
-        predictions = torch.max(y, 1)[1].view(batch.label.size())
-        n_correct_random_random += (predictions.data == batch.label.data).sum()
+        y = model(Variable(batch_text_random_random).transpose(0, 1))
+        preds.append(torch.max(y, 1)[1].view(batch.label.size()))
+        n_correct_random_random += (preds[4].data == batch.label.data).sum()
+
+        preds = [to_numpy(p) for p in preds]
+        for i in range(batch.batch_size):
+            checkpoint.append([])
+            checkpoint[-1].append((to_sentence(text[i]),
+                                   LABEL.vocab.itos[preds[0][i].item()]))
+            checkpoint[-1].append((to_sentence(batch_text_ordered_gradient[i]),
+                                   LABEL.vocab.itos[preds[1][i].item()]))
+            checkpoint[-1].append((to_sentence(batch_text_ordered_random[i]),
+                                   LABEL.vocab.itos[preds[2][i].item()]))
+            checkpoint[-1].append((to_sentence(batch_text_random_gradient[i]),
+                                   LABEL.vocab.itos[preds[3][i].item()]))
+            checkpoint[-1].append((to_sentence(batch_text_random_random[i]),
+                                   LABEL.vocab.itos[preds[4][i].item()]))
+
+    with open('bar.pkl', 'wb') as f:
+        pickle.dump(checkpoint, f)
 
     print(n_words / n_total)
-    print(n_correct / n_total)
+    print(n_correct / n_total * 100)
     print(n_correct_ordered_gradient / n_total * 100)
     print(n_correct_ordered_random / n_total * 100)
     print(n_correct_random_gradient / n_total * 100)
     print(n_correct_random_random / n_total * 100)
                 
 if __name__ == '__main__':
-    bar()
+    args = parse_args_lstm()
+    globals()[args.mode](args)
