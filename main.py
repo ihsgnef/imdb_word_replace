@@ -2,8 +2,9 @@ import os
 import sys
 import time
 import glob
-import argparse
+import random
 import pickle
+import argparse
 import numpy as np
 from tqdm import tqdm
 
@@ -15,99 +16,6 @@ from sklearn.neighbors import KDTree
 from torchtext import data
 from torchtext import datasets
 
-
-extracted_grads = {}
-def extract_grad_hook(name):
-    def hook(grad):
-        extracted_grads[name] = grad
-    return hook
-
-class ConvModel(nn.Module):
-    
-    def __init__(self, cfg):
-        super(ConvModel, self).__init__()
-        self.embed = nn.Embedding(cfg.vocab_size, cfg.embed_size)
-        if cfg.fix_embedding:
-            self.embed.weight.requires_grad = False
-        convs = []
-        for i, filter_size in enumerate(cfg.filter_sizes):
-            pad = filter_size // 2
-            conv = nn.Sequential(
-                    nn.Conv1d(cfg.embed_size, cfg.hidden_size, filter_size, padding=pad),
-                    nn.ReLU()
-                    )
-            convs.append(conv)
-        self.convs = nn.ModuleList(convs)
-        self.fconns = nn.Sequential(
-                nn.Dropout(cfg.dropout),
-                nn.Linear(cfg.hidden_size * len(cfg.filter_sizes), cfg.output_size)
-                )
-
-    def forward(self, inputs, extract_inputs_embed_grad=False):
-        inputs_embed = self.embed(inputs) 
-        if extract_inputs_embed_grad:
-            inputs_embed.register_hook(extract_grad_hook('inputs_embed'))
-        # length, batch_size, embed_size -> batch_size, embed_dim, length
-        inputs_embed = inputs_embed.transpose(0, 1).transpose(1, 2)
-        mots = []
-        for conv in self.convs:
-            conv_out = conv(inputs_embed)
-            mot, _ = conv_out.max(2)
-            mots.append(mot.squeeze(2))
-        mots = torch.cat(mots, 1)
-        output = self.fconns(mots)
-        return output
-                    
-
-class LSTMModel(nn.Module):
-
-    def __init__(self, cfg):
-        super(LSTMModel, self).__init__()
-        self.embed = nn.Embedding(cfg.vocab_size, cfg.embed_size)
-        if cfg.fix_embedding:
-            self.embed.weight.requires_grad = False
-        self.lstm = nn.LSTM(cfg.embed_size, cfg.hidden_size, cfg.num_layers)
-        self.fconns = nn.Sequential( 
-                nn.BatchNorm1d(cfg.hidden_size),
-                nn.Dropout(cfg.dropout),
-                nn.Linear(cfg.hidden_size, cfg.output_size)
-                )
-
-    def forward(self, inputs, extract_inputs_embed_grad=False):
-        length, batch_size = inputs.size()
-        hidden = self.init_hidden(batch_size)
-        inputs_embed = self.embed(inputs)
-        if extract_inputs_embed_grad:
-            inputs_embed.register_hook(extract_grad_hook('inputs_embed'))
-        output, hidden = self.lstm(inputs_embed, hidden)
-        output = output[-1]
-        output = self.fconns(output)
-        return output
-        
-    def init_weights(self):
-        init_range = 0.1
-        self.embed.weight.data.uniform_(-init_range, init_range)
-        self.embed.bias.data.fill_(0)
-        self.linear.weight.data.uniform_(-init_range, init_range)
-
-    def init_hidden(self, batch_size):
-        w = next(self.parameters()).data
-        num_layers = self.lstm.num_layers
-        hidden_size = self.lstm.hidden_size
-        return (Variable(w.new(num_layers, batch_size, hidden_size).zero_()),
-                Variable(w.new(num_layers, batch_size, hidden_size).zero_()))
-
-
-def makedirs(path):
-    import errno
-    try:
-        os.makedirs(path)
-    except OSError as ex:
-        if ex.errno == errno.EEXIST and os.path.isdir(path):
-            pass
-        else:
-            raise
-        
 def parse_args_common():
     parser = argparse.ArgumentParser()
     parser.add_argument('--fix_embedding', type=bool, default=False)
@@ -149,6 +57,92 @@ def parse_args_conv():
     return args
 
 parse_args = parse_args_lstm
+
+
+class ConvModel(nn.Module):
+    
+    def __init__(self, cfg):
+        super(ConvModel, self).__init__()
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.embed_size)
+        if cfg.fix_embedding:
+            self.embed.weight.requires_grad = False
+        convs = []
+        for i, filter_size in enumerate(cfg.filter_sizes):
+            pad = filter_size // 2
+            conv = nn.Sequential(
+                    nn.Conv1d(cfg.embed_size, cfg.hidden_size, filter_size, padding=pad),
+                    nn.ReLU()
+                    )
+            convs.append(conv)
+        self.convs = nn.ModuleList(convs)
+        self.fconns = nn.Sequential(
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.hidden_size * len(cfg.filter_sizes), cfg.output_size)
+                )
+
+    def forward(self, inputs, extract_embed_grad_hook=None):
+        inputs_embed = self.embed(inputs) 
+        if extract_embed_grad_hook:
+            inputs_embed.register_hook(extract_embed_grad_hook)
+        # length, batch_size, embed_size -> batch_size, embed_dim, length
+        inputs_embed = inputs_embed.transpose(0, 1).transpose(1, 2)
+        mots = []
+        for conv in self.convs:
+            conv_out = conv(inputs_embed)
+            mot, _ = conv_out.max(2)
+            mots.append(mot.squeeze(2))
+        mots = torch.cat(mots, 1)
+        output = self.fconns(mots)
+        return output
+                    
+
+class LSTMModel(nn.Module):
+
+    def __init__(self, cfg):
+        super(LSTMModel, self).__init__()
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.embed_size)
+        if cfg.fix_embedding:
+            self.embed.weight.requires_grad = False
+        self.lstm = nn.LSTM(cfg.embed_size, cfg.hidden_size, cfg.num_layers)
+        self.fconns = nn.Sequential( 
+                nn.BatchNorm1d(cfg.hidden_size),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.hidden_size, cfg.output_size)
+                )
+
+    def forward(self, inputs, extract_embed_grad_hook=None):
+        length, batch_size = inputs.size()
+        hidden = self.init_hidden(batch_size)
+        inputs_embed = self.embed(inputs)
+        if extract_embed_grad_hook:
+            inputs_embed.register_hook(extract_embed_grad_hook)
+        output, hidden = self.lstm(inputs_embed, hidden)
+        output = output[-1]
+        output = self.fconns(output)
+        return output
+        
+    def init_weights(self):
+        init_range = 0.1
+        self.embed.weight.data.uniform_(-init_range, init_range)
+        self.embed.bias.data.fill_(0)
+        self.linear.weight.data.uniform_(-init_range, init_range)
+
+    def init_hidden(self, batch_size):
+        w = next(self.parameters()).data
+        num_layers = self.lstm.num_layers
+        hidden_size = self.lstm.hidden_size
+        return (Variable(w.new(num_layers, batch_size, hidden_size).zero_()),
+                Variable(w.new(num_layers, batch_size, hidden_size).zero_()))
+
+def makedirs(path):
+    import errno
+    try:
+        os.makedirs(path)
+    except OSError as ex:
+        if ex.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
 
 def setup(args):
     torch.cuda.set_device(args.gpu)
@@ -338,9 +332,15 @@ def foo():
     
     out = open('output.txt', 'w')
     pkl = []
+    
+    extracted_grads = {}
+    def extract_grad_hook(name):
+        def hook(grad):
+            extracted_grads[name] = grad
+        return hook
 
     for batch_idx, batch in enumerate(tqdm(dev_iter)):
-        y = model(batch.text, extract_inputs_embed_grad=True)
+        y = model(batch.text, extract_grad_hook('inputs_embed'))
         loss = criterion(y, batch.label)
         model.zero_grad()
         loss.backward()
@@ -370,8 +370,8 @@ def foo():
 
 def bar():
     args = parse_args()
-    args.n_replace = 1
-    args.eps = 50000
+    args.n_replace = 5
+    args.eps = 10
     snapshot_prefix = os.path.join(
             args.save_path, args.model_name + '_best_snapshot')
     args.resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
@@ -388,12 +388,23 @@ def bar():
     # use better exclude list
     exclude_list = list(range(20))
 
-    n_correct = n_total = n_new_correct = 0
-    for batch_idx, batch in enumerate(dev_iter):
-        y = model(batch.text, extract_inputs_embed_grad=True)
+    extracted_grads = {}
+    def extract_grad_hook(name):
+        def hook(grad):
+            extracted_grads[name] = grad
+        return hook
+
+    n_correct = n_total = n_words = 0
+    n_correct_ordered_gradient = 0
+    n_correct_ordered_random = 0
+    n_correct_random_gradient = 0
+    n_correct_random_random = 0
+    for batch_idx, batch in enumerate(tqdm(dev_iter)):
+        y = model(batch.text, extract_grad_hook('inputs_embed'))
         predictions = torch.max(y, 1)[1].view(batch.label.size())
         n_correct += (predictions.data == batch.label.data).sum()
         n_total += batch.batch_size
+        n_words += batch.text.size(0) * batch.batch_size
 
         loss = criterion(y, batch.label)
         model.zero_grad()
@@ -406,27 +417,72 @@ def bar():
         text = batch.text.transpose(0, 1).data.cpu().numpy()
         y = y.data.cpu().numpy()
 
-        batch_text = batch.text.data
+        batch_text_ordered_gradient = batch.text.data.clone()
+        batch_text_ordered_random = batch.text.data.clone()
+        batch_text_random_gradient = batch.text.data.clone()
+        batch_text_random_random = batch.text.data.clone()
         for i in range(batch.batch_size):
+            remain_idxs = [j for j, x in enumerate(text[i]) if x not in exclude_list]
             order = np.argsort(np.abs(scores[i]))[::-1]
-            excluded_idxs = [j for j, x in enumerate(text[i]) if x in exclude_list]
-            order = [j for j in order if j not in excluded_idxs][:args.n_replace]
+            order = [j for j in order if j in remain_idxs]
 
-            for j in order:
-                old_embedding = TEXT.vocab.vectors[text[i][j]].numpy()
+            for j in order[:args.n_replace]:
+                old_embed = TEXT.vocab.vectors[text[i][j]].numpy()
                 word_grad = grads[i][j]
-                new_embedding = old_embedding + word_grad * args.eps
-                dists, inds = tree.query(new_embedding, k=2)
-                inds = inds[0]
-                replace = inds[0] if inds[0] != text[i][j] else inds[1]
-                batch_text[j][i] = replace.item()
+                word_grad /= np.linalg.norm(word_grad)
 
-        batch_text = Variable(batch_text)
-        y = model(batch_text, extract_inputs_embed_grad=True)
+                # ordered by norm of gradient and perturbed by gradient
+                new_embed_grd = old_embed + word_grad * args.eps
+                _, inds = tree.query(new_embed_grd, k=2)
+                repl = inds[0][0] if inds[0][0] != text[i][j] else inds[0][1]
+                batch_text_ordered_gradient[j][i] = repl.item()
+
+                # ordered by norm of gradient and perturbed by random noise
+                new_embed_rnd = old_embed + np.random.randn(args.embed_size) * args.eps
+                _, inds = tree.query(new_embed_rnd, k=2)
+                repl = inds[0][0] if inds[0][0] != text[i][j] else inds[0][1]
+                batch_text_ordered_random[j][i] = repl.item()
+
+            rnd_order = random.sample(remain_idxs, len(remain_idxs))
+            for j in rnd_order[:args.n_replace]:
+                old_embed = TEXT.vocab.vectors[text[i][j]].numpy()
+                word_grad = grads[i][j]
+                word_grad /= np.linalg.norm(word_grad)
+
+                # ordered by random and perturbed by gradient
+                new_embed = old_embed + word_grad * args.eps
+                _, inds = tree.query(new_embed, k=2)
+                repl = inds[0][0] if inds[0][0] != text[i][j] else inds[0][1]
+                batch_text_random_gradient[j][i] = repl.item()
+
+                # ordered by random and perturbed by random noise
+                new_embed = old_embed + np.random.randn(args.embed_size) * args.eps
+                _, inds = tree.query(new_embed, k=2)
+                repl = inds[0][0] if inds[0][0] != text[i][j] else inds[0][1]
+                batch_text_random_random[j][i] = repl.item()
+
+        y = model(Variable(batch_text_ordered_gradient))
         predictions = torch.max(y, 1)[1].view(batch.label.size())
-        n_new_correct += (predictions.data == batch.label.data).sum()
-        print(n_correct / n_total, n_new_correct / n_total)
-        
+        n_correct_ordered_gradient += (predictions.data == batch.label.data).sum()
+
+        y = model(Variable(batch_text_ordered_random))
+        predictions = torch.max(y, 1)[1].view(batch.label.size())
+        n_correct_ordered_random += (predictions.data == batch.label.data).sum()
+
+        y = model(Variable(batch_text_random_gradient))
+        predictions = torch.max(y, 1)[1].view(batch.label.size())
+        n_correct_random_gradient += (predictions.data == batch.label.data).sum()
+
+        y = model(Variable(batch_text_random_random))
+        predictions = torch.max(y, 1)[1].view(batch.label.size())
+        n_correct_random_random += (predictions.data == batch.label.data).sum()
+
+    print(n_words / n_total)
+    print(n_correct / n_total)
+    print(n_correct_ordered_gradient / n_total * 100)
+    print(n_correct_ordered_random / n_total * 100)
+    print(n_correct_random_gradient / n_total * 100)
+    print(n_correct_random_random / n_total * 100)
                 
 if __name__ == '__main__':
     bar()
