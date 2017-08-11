@@ -10,6 +10,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+from sklearn.neighbors import KDTree
 
 from torchtext import data
 from torchtext import datasets
@@ -26,6 +27,8 @@ class ConvModel(nn.Module):
     def __init__(self, cfg):
         super(ConvModel, self).__init__()
         self.embed = nn.Embedding(cfg.vocab_size, cfg.embed_size)
+        if cfg.fix_embedding:
+            self.embed.weight.requires_grad = False
         convs = []
         for i, filter_size in enumerate(cfg.filter_sizes):
             pad = filter_size // 2
@@ -61,6 +64,8 @@ class LSTMModel(nn.Module):
     def __init__(self, cfg):
         super(LSTMModel, self).__init__()
         self.embed = nn.Embedding(cfg.vocab_size, cfg.embed_size)
+        if cfg.fix_embedding:
+            self.embed.weight.requires_grad = False
         self.lstm = nn.LSTM(cfg.embed_size, cfg.hidden_size, cfg.num_layers)
         self.fconns = nn.Sequential( 
                 nn.BatchNorm1d(cfg.hidden_size),
@@ -105,6 +110,7 @@ def makedirs(path):
         
 def parse_args_common():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--fix_embedding', type=bool, default=False)
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--embed_size', type=int, default=300)
@@ -181,6 +187,7 @@ def setup(args):
 
     ### setup model
     if args.resume_snapshot:
+        print('loading snapshot', args.resume_snapshot)
         model = torch.load(args.resume_snapshot, 
                 map_location=lambda storage, location: storage.cuda(args.gpu))
     else:
@@ -200,7 +207,8 @@ def train():
 
     ### training setup
     criterion = nn.CrossEntropyLoss()
-    optim = torch.optim.Adam(model.parameters(), lr=args.lr)
+    parameters = filter(lambda w: w.requires_grad, model.parameters())
+    optim = torch.optim.Adam(parameters, lr=args.lr)
     train_iter.repeat = False
     makedirs(args.save_path)
     iterations = 0
@@ -282,14 +290,10 @@ def train():
 
 def test():
     args = parse_args()
-    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
-
     snapshot_prefix = os.path.join(
             args.save_path, args.model_name + '_best_snapshot')
-    resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
-    print(resume_snapshot)
-    model = torch.load(resume_snapshot, 
-            map_location=lambda storage, location: storage.cuda(args.gpu))
+    args.resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
+    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
 
     def eval(iterator):
         model.eval()
@@ -322,14 +326,10 @@ def clean_sentence(sent):
 
 def foo():
     args = parse_args()
-    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
-
     snapshot_prefix = os.path.join(
             args.save_path, args.model_name + '_best_snapshot')
-    resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
-    print(resume_snapshot)
-    model = torch.load(resume_snapshot, 
-            map_location=lambda storage, location: storage.cuda(args.gpu))
+    args.resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
+    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
 
     model.eval()
     criterion = nn.CrossEntropyLoss()
@@ -367,6 +367,66 @@ def foo():
             pkl[-1].append(order)
     with open('output.pkl', 'wb') as f:
         pickle.dump(pkl, f)
+
+def bar():
+    args = parse_args()
+    args.n_replace = 1
+    args.eps = 50000
+    snapshot_prefix = os.path.join(
+            args.save_path, args.model_name + '_best_snapshot')
+    args.resume_snapshot = glob.glob(snapshot_prefix + '*')[0]
+    args, TEXT, LABEL, train_iter, dev_iter, test_iter, model = setup(args)
+
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    dev_iter.init_epoch()
+    dev_iter.train = True
+
+    tree = KDTree(TEXT.vocab.vectors.numpy())
+    print('KDTree built for {} words'.format(len(TEXT.vocab)))
+
+    # use better exclude list
+    exclude_list = list(range(20))
+
+    n_correct = n_total = n_new_correct = 0
+    for batch_idx, batch in enumerate(dev_iter):
+        y = model(batch.text, extract_inputs_embed_grad=True)
+        predictions = torch.max(y, 1)[1].view(batch.label.size())
+        n_correct += (predictions.data == batch.label.data).sum()
+        n_total += batch.batch_size
+
+        loss = criterion(y, batch.label)
+        model.zero_grad()
+        loss.backward()
+
+        grads = extracted_grads['inputs_embed'].transpose(0, 1)
+        grads = grads.data.cpu()
+        scores = grads.sum(dim=2).squeeze(2).numpy()
+        grads = grads.numpy()
+        text = batch.text.transpose(0, 1).data.cpu().numpy()
+        y = y.data.cpu().numpy()
+
+        batch_text = batch.text.data
+        for i in range(batch.batch_size):
+            order = np.argsort(np.abs(scores[i]))[::-1]
+            excluded_idxs = [j for j, x in enumerate(text[i]) if x in exclude_list]
+            order = [j for j in order if j not in excluded_idxs][:args.n_replace]
+
+            for j in order:
+                old_embedding = TEXT.vocab.vectors[text[i][j]].numpy()
+                word_grad = grads[i][j]
+                new_embedding = old_embedding + word_grad * args.eps
+                dists, inds = tree.query(new_embedding, k=2)
+                inds = inds[0]
+                replace = inds[0] if inds[0] != text[i][j] else inds[1]
+                batch_text[j][i] = replace.item()
+
+        batch_text = Variable(batch_text)
+        y = model(batch_text, extract_inputs_embed_grad=True)
+        predictions = torch.max(y, 1)[1].view(batch.label.size())
+        n_new_correct += (predictions.data == batch.label.data).sum()
+        print(n_correct / n_total, n_new_correct / n_total)
         
+                
 if __name__ == '__main__':
-    foo()
+    bar()
